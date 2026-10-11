@@ -4484,6 +4484,47 @@ static void set_transfer_variables_all(struct ast_channel *transferer, struct ao
 	ao2_iterator_destroy(&iter);
 }
 
+/*
+ * Voicenter DQueue: an attended transfer into a consult leg that DQueue is
+ * holding in BridgeWait would splice a Local pair into the holding bridge, and
+ * BridgeWait tears that bridge down (and the transferee with it) when the
+ * consult leg leaves.  The dialplan marks such a leg in dqJoin with the
+ * extension to requeue the transferee to; the transfer then becomes a blind
+ * transfer into DQ_REQUEUE_CONTEXT.  See ASTERISK-23049.
+ */
+#define DQ_REQUEUE_CONTEXT "blc-itsp-xfer"
+#define DQ_REQUEUE_WAIT_CONTEXT "dqJoin"
+#define DQ_REQUEUE_EXTEN_VAR "ATXFER_REQUEUE_EXTEN"
+
+/*!
+ * \internal
+ * \brief Get the requeue extension if chan is a consult leg waiting in DQueue
+ *
+ * \param chan Channel to check
+ * \param bridge Bridge of chan, NULL if unbridged (e.g. playing an announcement)
+ *
+ * \return Allocated extension (caller frees), or NULL if chan is not such a leg
+ */
+static char *dq_requeue_exten(struct ast_channel *chan, struct ast_bridge *bridge)
+{
+	char *res = NULL;
+	const char *exten;
+
+	/* creator is set once at bridge construction, so no bridge lock is needed */
+	if (bridge && strcmp(bridge->creator, "BridgeWait")) {
+		return NULL;
+	}
+
+	ast_channel_lock(chan);
+	exten = pbx_builtin_getvar_helper(chan, DQ_REQUEUE_EXTEN_VAR);
+	if (!strcmp(ast_channel_context(chan), DQ_REQUEUE_WAIT_CONTEXT) && !ast_strlen_zero(exten)) {
+		res = ast_strdup(exten);
+	}
+	ast_channel_unlock(chan);
+
+	return res;
+}
+
 struct ast_bridge *ast_bridge_transfer_acquire_bridge(struct ast_channel *chan)
 {
 	struct ast_bridge *bridge;
@@ -4787,6 +4828,68 @@ enum ast_transfer_result ast_bridge_transfer_attended(struct ast_channel *to_tra
 	if (!to_transferee_bridge && !to_target_bridge) {
 		res = AST_BRIDGE_TRANSFER_INVALID;
 		goto end;
+	}
+
+	/*
+	 * Voicenter DQueue: requeue the transferee instead of splicing it into a
+	 * BridgeWait holding bridge.  Decided before anything is unheld, so a
+	 * refusal leaves the transferee on hold with the transferer.
+	 */
+	{
+		RAII_VAR(char *, transferee_exten, dq_requeue_exten(to_transferee, to_transferee_bridge), ast_free);
+		RAII_VAR(char *, target_exten, dq_requeue_exten(to_transfer_target, to_target_bridge), ast_free);
+
+		if (transferee_exten && target_exten) {
+			ast_log(LOG_NOTICE, "DQ atxfer: refused, both %s and %s are waiting in DQueue\n",
+				ast_channel_name(to_transferee), ast_channel_name(to_transfer_target));
+			res = AST_BRIDGE_TRANSFER_NOT_PERMITTED;
+			goto end;
+		}
+		if (transferee_exten || target_exten) {
+			struct ast_channel *queue_leg = target_exten ? to_transfer_target : to_transferee;
+			struct ast_channel *other_leg = target_exten ? to_transferee : to_transfer_target;
+			struct ast_bridge *other_bridge = target_exten ? to_transferee_bridge : to_target_bridge;
+			const char *exten = target_exten ?: transferee_exten;
+			int two_party = 0;
+
+			if (other_bridge) {
+				ast_bridge_lock(other_bridge);
+				two_party = other_bridge->num_channels == 2
+					&& !ast_test_flag(&other_bridge->feature_flags,
+						AST_BRIDGE_FLAG_TRANSFER_PROHIBITED | AST_BRIDGE_FLAG_TRANSFER_BRIDGE_ONLY);
+				ast_bridge_unlock(other_bridge);
+			}
+			if (!two_party) {
+				ast_log(LOG_NOTICE, "DQ atxfer: refused, %s is not in a transferable two-party bridge\n",
+					ast_channel_name(other_leg));
+				res = AST_BRIDGE_TRANSFER_NOT_PERMITTED;
+				goto end;
+			}
+			if (!ast_exists_extension(NULL, DQ_REQUEUE_CONTEXT, exten, 1, NULL)) {
+				ast_log(LOG_NOTICE, "DQ atxfer: refused, %s@%s does not exist\n",
+					exten, DQ_REQUEUE_CONTEXT);
+				res = AST_BRIDGE_TRANSFER_NOT_PERMITTED;
+				goto end;
+			}
+
+			res = ast_bridge_transfer_blind(1, other_leg, exten, DQ_REQUEUE_CONTEXT, NULL, NULL);
+			if (res != AST_BRIDGE_TRANSFER_SUCCESS) {
+				/* Never FAIL (end: would hang up the target) and never fall through to the Local pair */
+				ast_log(LOG_NOTICE, "DQ atxfer: blind transfer of %s's peer to %s@%s failed (%d)\n",
+					ast_channel_name(other_leg), exten, DQ_REQUEUE_CONTEXT, res);
+				res = AST_BRIDGE_TRANSFER_INVALID;
+				goto end;
+			}
+
+			ast_log(LOG_NOTICE, "DQ atxfer: requeued %s's peer to %s@%s, hanging up %s\n",
+				ast_channel_name(other_leg), exten, DQ_REQUEUE_CONTEXT, ast_channel_name(queue_leg));
+			pbx_builtin_setvar_helper(queue_leg, "ATXFER_REQUEUED", "1");
+			ast_softhangup(queue_leg, AST_SOFTHANGUP_DEV);
+			ast_attended_transfer_message_add_app(transfer_msg, "ATXFER_REQUEUE", NULL);
+			/* The blind transfer only removed other_leg from its bridge; hang it up if it is the target */
+			hangup_target = other_leg == to_transfer_target;
+			goto end;
+		}
 	}
 
 	ast_channel_lock(to_transferee);
