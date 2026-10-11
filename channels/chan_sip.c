@@ -29296,6 +29296,23 @@ static int handle_incoming(struct sip_pvt *p, struct sip_request *req, struct as
 			}
 			/* Otherwise, this is an ACK. It will always have a to-tag */
 		}
+	} else if (req->method == SIP_OPTIONS && !p->initreq.headers) {
+		/* Without pedantic checking, __find_call() matches on Call-ID only and
+		 * never sets req->has_to_tag, so an in-dialog OPTIONS (To-tag present)
+		 * for a dialog we no longer have arrives here on a freshly allocated pvt
+		 * and handle_request_options() would answer it as an out-of-dialog
+		 * capability query (200 OK when the Request-URI user is a known exten).
+		 * RFC 3261 12.2.2: answer 481 so dialog keepalives (e.g. OpenSIPS dialog
+		 * OPTIONS pings) can tear the stale dialog down. OPTIONS without a To-tag
+		 * (out-of-dialog probes, e.g. OpenSIPS dispatcher) are not affected.
+		 */
+		char totag[128];
+
+		if (gettag(req, "To", totag, sizeof(totag))) {
+			transmit_response(p, "481 Call/Transaction Does Not Exist", req);
+			sip_scheddestroy(p, DEFAULT_TRANS_TIMEOUT);
+			return res;
+		}
 	}
 
 	if (!e && (p->method == SIP_INVITE || p->method == SIP_SUBSCRIBE || p->method == SIP_REGISTER || p->method == SIP_NOTIFY || p->method == SIP_PUBLISH)) {
