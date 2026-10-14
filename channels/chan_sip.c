@@ -27216,6 +27216,17 @@ static int local_attended_transfer(struct sip_pvt *transferer, struct ast_channe
 
 	ast_set_flag(&transferer->flags[0], SIP_DEFER_BYE_ON_TRANSFER);	/* Delay hangup */
 
+	/*
+	 * Voicenter DQueue: if the bridge core turns this attended transfer into a
+	 * blind transfer (requeue into a DQueue leg), it hands the transferee the
+	 * same SIPTRANSFER_REFERER / SIPDOMAIN a native blind REFER would set.
+	 * transferer_chan is still locked here, as pbx_builtin_setvar_helper allows.
+	 */
+	pbx_builtin_setvar_helper(transferer_chan, "ATXFER_REFERRED_BY",
+		S_OR(transferer->refer->referred_by, NULL));
+	pbx_builtin_setvar_helper(transferer_chan, "ATXFER_REFER_DOMAIN",
+		S_OR(transferer->refer->refer_to_domain, NULL));
+
 	sip_pvt_unlock(transferer);
 	ast_channel_unlock(transferer_chan);
 	*nounlock = 1;

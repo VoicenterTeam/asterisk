@@ -4509,20 +4509,101 @@ static char *dq_requeue_exten(struct ast_channel *chan, struct ast_bridge *bridg
 {
 	char *res = NULL;
 	const char *exten;
-
-	/* creator is set once at bridge construction, so no bridge lock is needed */
-	if (bridge && strcmp(bridge->creator, "BridgeWait")) {
-		return NULL;
-	}
+	const char *why = NULL;
 
 	ast_channel_lock(chan);
 	exten = pbx_builtin_getvar_helper(chan, DQ_REQUEUE_EXTEN_VAR);
-	if (!strcmp(ast_channel_context(chan), DQ_REQUEUE_WAIT_CONTEXT) && !ast_strlen_zero(exten)) {
+	if (ast_strlen_zero(exten)) {
+		/* not a DQueue leg at all: the common case, stay quiet */
+	} else if (strcmp(ast_channel_context(chan), DQ_REQUEUE_WAIT_CONTEXT)) {
+		why = "context is not " DQ_REQUEUE_WAIT_CONTEXT;
+	} else if (bridge && strcmp(bridge->creator, "BridgeWait")) {
+		/* creator is set once at bridge construction, so no bridge lock is needed */
+		why = "its bridge was not created by BridgeWait";
+	} else {
 		res = ast_strdup(exten);
+	}
+	if (why) {
+		ast_log(LOG_NOTICE, "DQ atxfer: %s carries %s=%s but is ignored: %s (context=%s, bridge creator=%s)\n",
+			ast_channel_name(chan), DQ_REQUEUE_EXTEN_VAR, exten, why,
+			ast_channel_context(chan), bridge ? bridge->creator : "none");
 	}
 	ast_channel_unlock(chan);
 
 	return res;
+}
+
+/*!
+ * \internal
+ * \brief Log one leg of an attended transfer as the requeue gate sees it
+ */
+static void dq_atxfer_describe(const char *role, struct ast_channel *chan, struct ast_bridge *bridge)
+{
+	char bridge_desc[256] = "none";
+
+	if (bridge) {
+		ast_bridge_lock(bridge);
+		snprintf(bridge_desc, sizeof(bridge_desc), "%s tech=%s creator=%s chans=%u%s",
+			bridge->uniqueid, bridge->technology ? bridge->technology->name : "?",
+			S_OR(bridge->creator, "?"), bridge->num_channels,
+			ast_test_flag(&bridge->feature_flags, AST_BRIDGE_FLAG_TRANSFER_PROHIBITED) ? " transfer-prohibited" : "");
+		ast_bridge_unlock(bridge);
+	}
+
+	ast_channel_lock(chan);
+	ast_log(LOG_NOTICE, "DQ atxfer: %s %s at %s,%s,%d app=%s %s=%s referred_by=%s bridge=%s\n",
+		role, ast_channel_name(chan), ast_channel_context(chan), ast_channel_exten(chan),
+		ast_channel_priority(chan), S_OR(ast_channel_appl(chan), "none"), DQ_REQUEUE_EXTEN_VAR,
+		S_OR(pbx_builtin_getvar_helper(chan, DQ_REQUEUE_EXTEN_VAR), "-"),
+		S_OR(pbx_builtin_getvar_helper(chan, "ATXFER_REFERRED_BY"), "-"), bridge_desc);
+	ast_channel_unlock(chan);
+}
+
+/*! \brief What the transferee of a DQueue requeue inherits from the REFER */
+struct dq_requeue_referer {
+	char *referred_by;
+	char *domain;
+};
+
+/*!
+ * \internal
+ * \brief Copy the REFER's Referred-By and domain off the channel that carried it
+ *
+ * chan_sip stores them as ATXFER_REFERRED_BY / ATXFER_REFER_DOMAIN before it
+ * starts the attended transfer.  Free with dq_requeue_referer_free().
+ */
+static void dq_requeue_referer_get(struct ast_channel *chan, struct dq_requeue_referer *referer)
+{
+	ast_channel_lock(chan);
+	referer->referred_by = ast_strdup(S_OR(pbx_builtin_getvar_helper(chan, "ATXFER_REFERRED_BY"), NULL));
+	referer->domain = ast_strdup(S_OR(pbx_builtin_getvar_helper(chan, "ATXFER_REFER_DOMAIN"), NULL));
+	ast_channel_unlock(chan);
+}
+
+static void dq_requeue_referer_free(struct dq_requeue_referer *referer)
+{
+	ast_free(referer->referred_by);
+	ast_free(referer->domain);
+}
+
+/*!
+ * \internal
+ * \brief Blind-transfer callback: set what chan_sip's own blind REFER sets
+ *
+ * blc-itsp-xfer authorises the transfer from SIPTRANSFER_REFERER; without it
+ * xml_sswDnidAuth answers "Wrong CALLERID" and the transferee is hung up.
+ */
+static void dq_requeue_set_referer(struct ast_channel *chan, struct transfer_channel_data *user_data_wrapper,
+		enum ast_transfer_type transfer_type)
+{
+	struct dq_requeue_referer *referer = user_data_wrapper->data;
+
+	if (ast_strlen_zero(referer->referred_by)) {
+		return;
+	}
+	pbx_builtin_setvar_helper(chan, "SIPTRANSFER", "yes");
+	pbx_builtin_setvar_helper(chan, "SIPTRANSFER_REFERER", referer->referred_by);
+	pbx_builtin_setvar_helper(chan, "SIPDOMAIN", referer->domain);
 }
 
 struct ast_bridge *ast_bridge_transfer_acquire_bridge(struct ast_channel *chan)
@@ -4834,7 +4915,12 @@ enum ast_transfer_result ast_bridge_transfer_attended(struct ast_channel *to_tra
 	 * Voicenter DQueue: requeue the transferee instead of splicing it into a
 	 * BridgeWait holding bridge.  Decided before anything is unheld, so a
 	 * refusal leaves the transferee on hold with the transferer.
+	 *
+	 * Every attended transfer logs both legs as the gate sees them, so one
+	 * that drops a call can be explained from the full log alone.
 	 */
+	dq_atxfer_describe("leg A (REFER dialog)", to_transferee, to_transferee_bridge);
+	dq_atxfer_describe("leg B (Replaces dialog)", to_transfer_target, to_target_bridge);
 	{
 		RAII_VAR(char *, transferee_exten, dq_requeue_exten(to_transferee, to_transferee_bridge), ast_free);
 		RAII_VAR(char *, target_exten, dq_requeue_exten(to_transfer_target, to_target_bridge), ast_free);
@@ -4851,6 +4937,7 @@ enum ast_transfer_result ast_bridge_transfer_attended(struct ast_channel *to_tra
 			struct ast_bridge *other_bridge = target_exten ? to_transferee_bridge : to_target_bridge;
 			const char *exten = target_exten ?: transferee_exten;
 			int two_party = 0;
+			struct dq_requeue_referer referer;
 
 			if (other_bridge) {
 				ast_bridge_lock(other_bridge);
@@ -4860,8 +4947,8 @@ enum ast_transfer_result ast_bridge_transfer_attended(struct ast_channel *to_tra
 				ast_bridge_unlock(other_bridge);
 			}
 			if (!two_party) {
-				ast_log(LOG_NOTICE, "DQ atxfer: refused, %s is not in a transferable two-party bridge\n",
-					ast_channel_name(other_leg));
+				ast_log(LOG_NOTICE, "DQ atxfer: refused, %s is not in a transferable two-party bridge (%s)\n",
+					ast_channel_name(other_leg), other_bridge ? "see its bridge in the leg lines above" : "it is not bridged");
 				res = AST_BRIDGE_TRANSFER_NOT_PERMITTED;
 				goto end;
 			}
@@ -4872,17 +4959,34 @@ enum ast_transfer_result ast_bridge_transfer_attended(struct ast_channel *to_tra
 				goto end;
 			}
 
-			res = ast_bridge_transfer_blind(1, other_leg, exten, DQ_REQUEUE_CONTEXT, NULL, NULL);
+			/* chan_sip passes the channel whose dialog carried the REFER first */
+			dq_requeue_referer_get(to_transferee, &referer);
+			if (ast_strlen_zero(referer.referred_by)) {
+				dq_requeue_referer_free(&referer);
+				dq_requeue_referer_get(to_transfer_target, &referer);
+			}
+			if (ast_strlen_zero(referer.referred_by)) {
+				ast_log(LOG_WARNING, "DQ atxfer: no ATXFER_REFERRED_BY on %s or %s; %s %s reaches %s without "
+					"SIPTRANSFER_REFERER and xml_sswDnidAuth may refuse it\n",
+					ast_channel_name(to_transferee), ast_channel_name(to_transfer_target),
+					"the peer of", ast_channel_name(other_leg), DQ_REQUEUE_CONTEXT);
+			}
+			/* The callback runs synchronously, before ast_bridge_transfer_blind returns */
+			res = ast_bridge_transfer_blind(1, other_leg, exten, DQ_REQUEUE_CONTEXT,
+				dq_requeue_set_referer, &referer);
 			if (res != AST_BRIDGE_TRANSFER_SUCCESS) {
 				/* Never FAIL (end: would hang up the target) and never fall through to the Local pair */
 				ast_log(LOG_NOTICE, "DQ atxfer: blind transfer of %s's peer to %s@%s failed (%d)\n",
 					ast_channel_name(other_leg), exten, DQ_REQUEUE_CONTEXT, res);
+				dq_requeue_referer_free(&referer);
 				res = AST_BRIDGE_TRANSFER_INVALID;
 				goto end;
 			}
 
-			ast_log(LOG_NOTICE, "DQ atxfer: requeued %s's peer to %s@%s, hanging up %s\n",
-				ast_channel_name(other_leg), exten, DQ_REQUEUE_CONTEXT, ast_channel_name(queue_leg));
+			ast_log(LOG_NOTICE, "DQ atxfer: requeued %s's peer to %s@%s (referred by %s), hanging up %s\n",
+				ast_channel_name(other_leg), exten, DQ_REQUEUE_CONTEXT,
+				S_OR(referer.referred_by, "unknown"), ast_channel_name(queue_leg));
+			dq_requeue_referer_free(&referer);
 			pbx_builtin_setvar_helper(queue_leg, "ATXFER_REQUEUED", "1");
 			ast_softhangup(queue_leg, AST_SOFTHANGUP_DEV);
 			ast_attended_transfer_message_add_app(transfer_msg, "ATXFER_REQUEUE", NULL);
