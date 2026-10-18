@@ -4495,10 +4495,16 @@ static void set_transfer_variables_all(struct ast_channel *transferer, struct ao
 #define DQ_REQUEUE_CONTEXT "blc-itsp-xfer"
 #define DQ_REQUEUE_WAIT_CONTEXT "dqJoin"
 #define DQ_REQUEUE_EXTEN_VAR "ATXFER_REQUEUE_EXTEN"
+/* A consult leg still ringing an agent from dqAvailable (Dial, unbridged) */
+#define DQ_REQUEUE_RING_CONTEXT "dqAvailable"
+#define DQ_RING_REQUEUE_EXTEN_VAR "DQ_RING_REQUEUE_EXTEN"
 
 /*!
  * \internal
  * \brief Get the requeue extension if chan is a consult leg waiting in DQueue
+ *
+ * Waiting: context dqJoin, ATXFER_REQUEUE_EXTEN set, unbridged or in a BridgeWait bridge.
+ * Ringing: context dqAvailable, still in Dial and unbridged, DQ_RING_REQUEUE_EXTEN set.
  *
  * \param chan Channel to check
  * \param bridge Bridge of chan, NULL if unbridged (e.g. playing an announcement)
@@ -4512,6 +4518,21 @@ static char *dq_requeue_exten(struct ast_channel *chan, struct ast_bridge *bridg
 	const char *why = NULL;
 
 	ast_channel_lock(chan);
+	/*
+	 * Still ringing an agent from dqAvailable: without this, the transfer masquerades the
+	 * transferee into the ringing leg, which keeps the transferring agent's identity. Once the
+	 * agent answers, the leg is bridged and the ordinary transfer applies.
+	 */
+	if (!bridge && !strcmp(ast_channel_context(chan), DQ_REQUEUE_RING_CONTEXT)
+		&& !strcmp(S_OR(ast_channel_appl(chan), ""), "Dial")) {
+		exten = pbx_builtin_getvar_helper(chan, DQ_RING_REQUEUE_EXTEN_VAR);
+		if (!ast_strlen_zero(exten)) {
+			res = ast_strdup(exten);
+		}
+		ast_channel_unlock(chan);
+		return res;
+	}
+
 	exten = pbx_builtin_getvar_helper(chan, DQ_REQUEUE_EXTEN_VAR);
 	if (ast_strlen_zero(exten)) {
 		/* not a DQueue leg at all: the common case, stay quiet */
