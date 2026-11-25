@@ -215,6 +215,48 @@ static void set_channel_format(struct websocket_pvt * instance,
  * every 20ms (or whatever the timer is set to) even if there are
  * no frames in the queue.
  */
+/*!
+ * \internal
+ * \brief Get a reference to the instance's websocket session, or NULL.
+ *
+ * webchan_hangup() closes the session and sets instance->websocket to NULL
+ * under the instance lock, from whatever thread hangs the channel up. Every
+ * user outside that lock must take its own reference here first: checking
+ * instance->websocket and then using it races with hangup and dereferences
+ * NULL (seen as a segfault in __ast_websocket_write(session=0x0) sending
+ * MEDIA_START). A write to a session that hangup has closed just fails.
+ *
+ * Release with ast_websocket_unref().
+ */
+static struct ast_websocket *websocket_get(struct websocket_pvt *instance)
+{
+	struct ast_websocket *ws;
+
+	ao2_lock(instance);
+	ws = instance->websocket;
+	if (ws) {
+		ast_websocket_ref(ws);
+	}
+	ao2_unlock(instance);
+
+	return ws;
+}
+
+/*! \internal \brief Send a TEXT frame, or fail if the websocket is gone. */
+static int websocket_write_string(struct websocket_pvt *instance, const char *text)
+{
+	struct ast_websocket *ws = websocket_get(instance);
+	int res;
+
+	if (!ws) {
+		return -1;
+	}
+	res = ast_websocket_write_string(ws, text);
+	ast_websocket_unref(ws);
+
+	return res;
+}
+
 static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 {
 	struct ast_frame *queued_frame = NULL;
@@ -240,7 +282,7 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 		instance->queue_full = 0;
 		ast_debug(4, "%s: WebSocket sending MEDIA_XON\n",
 			ast_channel_name(instance->channel));
-		ast_websocket_write_string(instance->websocket, MEDIA_XON);
+		websocket_write_string(instance, MEDIA_XON);
 	}
 
 	queued_frame = AST_LIST_REMOVE_HEAD(&instance->frame_queue, frame_list);
@@ -256,7 +298,7 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 			instance->report_queue_drained = 0;
 			ast_debug(4, "%s: WebSocket sending QUEUE_DRAINED\n",
 				ast_channel_name(instance->channel));
-			ast_websocket_write_string(instance->websocket, QUEUE_DRAINED);
+			websocket_write_string(instance, QUEUE_DRAINED);
 		}
 		return NULL;
 	}
@@ -282,7 +324,7 @@ static struct ast_frame *dequeue_frame(struct websocket_pvt *instance)
 			 * We just need to send the data to the websocket.
 			 * The data should already be NULL terminated.
 			 */
-			ast_websocket_write_string(instance->websocket,
+			websocket_write_string(instance,
 				queued_frame->data.ptr);
 			ast_debug(4, "%s: WebSocket sending %s\n",
 				ast_channel_name(instance->channel), (char *)queued_frame->data.ptr);
@@ -447,7 +489,7 @@ static int queue_frame_from_buffer(struct websocket_pvt *instance,
 			instance->queue_full = 1;
 			ast_debug(4, "%s: WebSocket sending %s\n",
 				ast_channel_name(instance->channel), MEDIA_XOFF);
-			ast_websocket_write_string(instance->websocket, MEDIA_XOFF);
+			websocket_write_string(instance, MEDIA_XOFF);
 		}
 	}
 
@@ -605,7 +647,7 @@ static int process_text_message(struct websocket_pvt *instance,
 		} else {
 			ast_debug(4, "%s: WebSocket status: %s\n",
 				ast_channel_name(instance->channel), status);
-			res = ast_websocket_write_string(instance->websocket, status);
+			res = websocket_write_string(instance, status);
 			ast_free(status);
 		}
 
@@ -770,15 +812,18 @@ static int read_from_ws_and_queue(struct websocket_pvt *instance)
 	int fragmented = 0;
 	int res = 0;
 
-	if (!instance || !instance->websocket) {
-		ast_log(LOG_WARNING, "%s: WebSocket instance not found\n",
-			ast_channel_name(instance->channel));
+	struct ast_websocket *ws;
+
+	ws = instance ? websocket_get(instance) : NULL;
+	if (!ws) {
+		ast_debug(3, "%s: WebSocket gone (hung up)\n",
+			instance ? ast_channel_name(instance->channel) : "unknown");
 		return -1;
 	}
 
 	ast_debug(9, "%s: Waiting for websocket to have data\n", ast_channel_name(instance->channel));
-	res = ast_wait_for_input(
-		ast_websocket_fd(instance->websocket), -1);
+	res = ast_wait_for_input(ast_websocket_fd(ws), -1);
+	ast_websocket_unref(ws);
 	if (res <= 0) {
 		ast_log(LOG_WARNING, "%s: WebSocket read failed: %s\n",
 			ast_channel_name(instance->channel), strerror(errno));
@@ -856,7 +901,7 @@ static void *read_thread_handler(void *obj)
 		ast_log(LOG_ERROR, "%s: Failed to create MEDIA_START\n", ast_channel_name(instance->channel));
 		return NULL;
 	}
-	res = ast_websocket_write_string(instance->websocket, command);
+	res = websocket_write_string(instance, command);
 	if (res != 0) {
 		ast_log(LOG_ERROR, "%s: Failed to send MEDIA_START\n", ast_channel_name(instance->channel));
 		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
@@ -907,8 +952,18 @@ static int webchan_write(struct ast_channel *ast, struct ast_frame *f)
 		return -1;
 	}
 
-	return ast_websocket_write(instance->websocket, AST_WEBSOCKET_OPCODE_BINARY,
-		(char *)f->data.ptr, (uint64_t)f->datalen);
+	{
+		struct ast_websocket *ws = websocket_get(instance);
+		int res;
+
+		if (!ws) {
+			return -1;
+		}
+		res = ast_websocket_write(ws, AST_WEBSOCKET_OPCODE_BINARY,
+			(char *)f->data.ptr, (uint64_t)f->datalen);
+		ast_websocket_unref(ws);
+		return res;
+	}
 }
 
 /*!
@@ -1513,7 +1568,7 @@ static int webchan_send_dtmf_text(struct ast_channel *ast, char digit, unsigned 
 			ast_log(LOG_ERROR, "%s: Failed to create DTMF_END\n", ast_channel_name(instance->channel));
 			return 0;
 		}
-		res = ast_websocket_write_string(instance->websocket, command);
+		res = websocket_write_string(instance, command);
 		if (res != 0) {
 			ast_log(LOG_ERROR, "%s: Failed to send DTMF_END\n", ast_channel_name(instance->channel));
 			ast_free(command);
@@ -1602,7 +1657,7 @@ static void incoming_ws_established_cb(struct ast_websocket *ast_ws_session,
 	instance->websocket = ao2_bump(ast_ws_session);
 	ao2_unlock(instance);
 
-	if (setsockopt(ast_websocket_fd(instance->websocket),
+	if (setsockopt(ast_websocket_fd(ast_ws_session),
 		IPPROTO_TCP, TCP_NODELAY, (char *) &nodelay, sizeof(nodelay)) < 0) {
 		ast_log(LOG_WARNING, "Failed to set TCP_NODELAY on manager connection: %s\n", strerror(errno));
 	}
