@@ -1560,24 +1560,47 @@ static void incoming_ws_established_cb(struct ast_websocket *ast_ws_session,
 		 * Just in case though...
 		 */
 		ast_log(LOG_WARNING, "WebSocket connection id not found\n");
-		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
+		/* No instance to hang up here: instance is still NULL. */
 		ast_websocket_close(ast_ws_session, 1000);
 		return;
 	}
 
-	instance = ao2_weakproxy_find(instances, connection_id, OBJ_SEARCH_KEY | OBJ_NOLOCK, "");
+	/*
+	 * No OBJ_NOLOCK: we do not hold the instances lock. With OBJ_NOLOCK,
+	 * __ao2_weakproxy_find() samples whatever lock state another thread
+	 * left on the container and restores it on exit, so it can unlock a
+	 * read lock this thread never took and return holding the write lock.
+	 * Nothing releases that lock, and every websocket_new() and instance
+	 * unlink then blocks on it forever.
+	 */
+	instance = ao2_weakproxy_find(instances, connection_id, OBJ_SEARCH_KEY, "");
 	if (!instance) {
 		/*
-		 * This also can't really happen because websocket_http_callback won't
-		 * let it get this far if it can't find the instance.
-		 * Just in case though...
+		 * The channel can be hung up between the HTTP upgrade and here.
+		 * instance is NULL, so there is no channel to queue a hangup on.
 		 */
 		ast_log(LOG_WARNING, "%s: WebSocket instance not found\n", connection_id);
-		ast_queue_control(instance->channel, AST_CONTROL_HANGUP);
 		ast_websocket_close(ast_ws_session, 1000);
 		return;
 	}
+
+	/*
+	 * incoming_ws_http_callback() refuses a second connection for this id,
+	 * but two upgrades can both pass that check before either gets here.
+	 * Check and claim under the instance lock, which webchan_hangup() and
+	 * the read path also take around instance->websocket.
+	 */
+	ao2_lock(instance);
+	if (instance->websocket) {
+		ao2_unlock(instance);
+		ast_log(LOG_WARNING, "%s: Websocket already connected, closing the new connection\n",
+			connection_id);
+		ast_websocket_close(ast_ws_session, 1000);
+		ao2_cleanup(instance);
+		return;
+	}
 	instance->websocket = ao2_bump(ast_ws_session);
+	ao2_unlock(instance);
 
 	if (setsockopt(ast_websocket_fd(instance->websocket),
 		IPPROTO_TCP, TCP_NODELAY, (char *) &nodelay, sizeof(nodelay)) < 0) {
@@ -1631,7 +1654,8 @@ static int incoming_ws_http_callback(struct ast_tcptls_session_instance *ser,
 	 * only the path components after that in the 'uri' parameter.
 	 * This should leave only the connection id without a leading '/'.
 	 */
-	instance = ao2_weakproxy_find(instances, uri, OBJ_SEARCH_KEY | OBJ_NOLOCK, "");
+	/* No OBJ_NOLOCK: we do not hold the instances lock (see incoming_ws_established_cb). */
+	instance = ao2_weakproxy_find(instances, uri, OBJ_SEARCH_KEY, "");
 	if (!instance) {
 		ast_log(LOG_WARNING, "%s: WebSocket instance not found\n", uri);
 		ast_http_error(ser, 404, "Not found", "WebSocket instance not found");
@@ -1640,6 +1664,8 @@ static int incoming_ws_http_callback(struct ast_tcptls_session_instance *ser,
 
 	/*
 	 * We don't allow additional connections using the same connection id.
+	 * This is an early answer only; incoming_ws_established_cb() makes the
+	 * binding check under the instance lock.
 	 */
 	if (instance->websocket) {
 		ast_log(LOG_WARNING, "%s: Websocket already connected for channel '%s'\n",
