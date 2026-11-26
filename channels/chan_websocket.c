@@ -1465,6 +1465,14 @@ static struct ast_channel *webchan_request(const char *type,
 		goto failure;
 	}
 
+	/*
+	 * The channel name ends in the instance address, so nearly every channel is
+	 * a new device. Without this flag each hangup caches one device state (and
+	 * creates its devicestate topic) that nothing ever removes. Upstream sets it
+	 * too; Local channels do the same (core_unreal.c).
+	 */
+	ast_set_flag(ast_channel_flags(chan), AST_FLAG_DISABLE_DEVSTATE_CACHE);
+
 	ast_debug(3, "%s: WebSocket channel %s allocated for connection %s\n",
 		ast_channel_name(chan), requestor_name,
 		instance->connection_id);
